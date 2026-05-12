@@ -1,18 +1,67 @@
-import pdfplumber
+import fitz  # PyMuPDF
 import html as htmllib
 import re
 
+# ---------- text cleaning ----------
+
+def dedup_phrase(text):
+    """Remove word-level N-tuple repetitions (PyMuPDF bold artifact)."""
+    words = text.split()
+    n = len(words)
+    for phrase_len in range(1, n // 3 + 1):
+        phrase = words[:phrase_len]
+        copies, pos = 1, phrase_len
+        while pos + phrase_len <= n and words[pos:pos + phrase_len] == phrase:
+            copies += 1
+            pos += phrase_len
+        if copies >= 3:
+            remaining = words[pos:]
+            # trim any trailing partial copy of the same phrase
+            for trim_len in range(min(phrase_len, len(remaining)), 0, -1):
+                if remaining[:trim_len] == phrase[:trim_len]:
+                    remaining = remaining[trim_len:]
+                    break
+            return ' '.join(phrase) + (' ' + ' '.join(remaining) if remaining else '')
+    return text
+
 def clean(text):
-    # Collapse 4x repeated characters (PDF bold font artifact: "TTTThhhheeee" -> "The")
-    return re.sub(r'(.)\1{3,}', r'\1', text)
+    text = re.sub(r'(.)\1{3,}', r'\1', text)       # char-level 4× repetition
+    lines = [dedup_phrase(l) for l in text.split('\n') if l.strip()]
+    result = dedup_phrase(' '.join(lines).strip())  # deduplicate after joining lines
+    return re.sub(r'  +', ' ', result)              # collapse PDF justification spaces
 
-# Arabic combining/diacritical mark ranges (tashkeel, etc.)
-ARABIC_DIACRITICS = re.compile(
-    r'^[\sؐ-ًؚ-ٰٟۖ-ۜ۟-۪ۤۧۨ-ۭ‌‍﻿]+$'
-)
+def esc(text):
+    return htmllib.escape(text) if text else ''
 
-def is_real_word(word):
-    return not ARABIC_DIACRITICS.match(word['text'])
+# Arabic Unicode block (for splitting mixed-language blocks)
+_AR = re.compile(r'[؀-ۿݐ-ݿﭐ-﷿ﹰ-﻿]')
+
+def split_ar_en(text):
+    """Split a mixed block into (non-Arabic part, Arabic part)."""
+    tokens = re.split(r'(\s+)', text)
+    en_words, ar_words = [], []
+    for tok in tokens:
+        if _AR.search(tok):
+            ar_words.append(tok)
+        else:
+            en_words.append(tok)
+    return ''.join(en_words).strip(), ''.join(ar_words).strip()
+
+# ---------- column detection ----------
+
+def block_col(x0, x1, w):
+    xc = (x0 + x1) / 2 / w
+    full_width = x0 / w < 0.10 and x1 / w > 0.60
+    if full_width:
+        return 'mixed'          # direction note / header spanning all columns
+    if xc < 0.30:
+        return 'en'
+    elif xc < 0.60:
+        return 'cop'
+    else:
+        return 'ar'
+
+# ---------- HTML template ----------
 
 HTML_HEAD = '''<!DOCTYPE html>
 <html lang="en">
@@ -22,101 +71,89 @@ HTML_HEAD = '''<!DOCTYPE html>
     <title>The Crowning Prayer — Paul &amp; Tabitha</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { background: #000; font-family: Georgia, serif; padding: 20px 10px; max-width: 1200px; margin: 0 auto; line-height: 1.75; }
-        .cross { text-align: center; font-size: 3rem; color: #c8a84b; margin-bottom: 10px; }
-        h1 { text-align: center; font-size: 1.7rem; color: #c8a84b; margin-bottom: 6px; letter-spacing: 2px; }
-        .sub { text-align: center; font-size: 1rem; color: #c8a84b; margin-bottom: 28px; font-style: italic; }
-        table { width: 100%; border-collapse: collapse; table-layout: fixed; }
-        td { padding: 1px 6px; vertical-align: top; font-size: 0.87rem; }
-        .en  { color: #ffffff; width: 38%; }
-        .cop { color: #c8a84b; width: 30%; }
-        .ar  { color: #87ceeb; width: 32%; direction: rtl; text-align: right; }
-        tr.gap td { height: 8px; }
-        tr.pb  td { height: 3px; border-top: 1px solid #2a2a2a; }
+        body { background: #000; font-family: Georgia, serif;
+               padding: 20px 12px; margin: 0 auto; max-width: 1300px;
+               line-height: 1.75; }
+        .cross { text-align: center; font-size: 3rem; color: #c8a84b;
+                 margin-bottom: 10px; }
+        h1 { text-align: center; font-size: 1.7rem; color: #c8a84b;
+             margin-bottom: 6px; letter-spacing: 2px; }
+        .sub { text-align: center; font-size: 1rem; color: #c8a84b;
+               margin-bottom: 28px; font-style: italic; }
+        /* Three-column flex layout */
+        .columns { display: flex; gap: 18px; align-items: flex-start; }
+        .col { flex: 1 1 0; min-width: 0; padding: 0 4px; }
+        .col-en  { color: #ffffff; }
+        .col-cop { color: #c8a84b; }
+        .col-ar  { color: #87ceeb; direction: rtl; text-align: right; }
+        .col p { font-size: 0.88rem; margin-bottom: 8px; }
+        .col-header { font-size: 0.75rem; font-weight: bold;
+                      letter-spacing: 2px; text-transform: uppercase;
+                      opacity: 0.5; margin-bottom: 10px; text-align: center; }
+        @media (max-width: 700px) {
+            .columns { flex-direction: column; }
+            .col { width: 100%; }
+            .col-ar { text-align: right; }
+        }
     </style>
 </head>
 <body>
-<div class="cross">☩</div>
+<div class="cross">&#9769;</div>
 <h1>The Crowning Prayer</h1>
 <div class="sub">Paul Meawad &amp; Tabitha</div>
-<table><tbody>
+<div class="columns">
+<div class="col col-en"><p class="col-header">English</p>
 '''
 
-HTML_FOOT = '</tbody></table></body></html>\n'
+HTML_MID1 = '</div>\n<div class="col col-cop"><p class="col-header">Coptic</p>\n'
+HTML_MID2 = '</div>\n<div class="col col-ar"><p class="col-header">&#1593;&#1585;&#1576;&#1610;</p>\n'
+HTML_FOOT = '</div>\n</div>\n</body>\n</html>\n'
 
-def esc(text):
-    return htmllib.escape(text) if text else ''
+# ---------- extraction ----------
 
-rows_out = []
+en_paras, cop_paras, ar_paras = [], [], []
 
-with pdfplumber.open("crowning_Crowning Prayer Paul & Tabitha.pdf") as pdf:
-    total_pages = len(pdf.pages)
-    for page_num, page in enumerate(pdf.pages):
-        w = page.width
-        c1 = w * 0.35   # English / Coptic boundary (~35%)
-        c2 = w * 0.66   # Coptic / Arabic boundary (~66%, gap confirmed at 64-68%)
-
-        words = page.extract_words(x_tolerance=3, y_tolerance=3)
-        if not words:
-            continue
-
-        # Drop Arabic-diacritical-only tokens (combining marks extracted as lone words)
-        words = [ww for ww in words if is_real_word(ww)]
-        words.sort(key=lambda ww: (round(ww['top']), ww['x0']))
-
-        # Group words into lines by y-proximity
-        line_groups = []
-        cur = []
-        base_y = None
-        for word in words:
-            if base_y is None or abs(word['top'] - base_y) <= 5:
-                cur.append(word)
-                if base_y is None:
-                    base_y = word['top']
+with fitz.open("crowning_Crowning Prayer Paul & Tabitha.pdf") as doc:
+    for page in doc:
+        w = page.rect.width
+        for b in page.get_text('blocks', sort=True):
+            x0, y0, x1, y1, text, bno, btype = b
+            if btype != 0 or not text.strip():
+                continue
+            text = clean(text)
+            if not text:
+                continue
+            col = block_col(x0, x1, w)
+            if col == 'mixed':
+                en_part, ar_part = split_ar_en(text)
+                if en_part:
+                    en_paras.append(en_part)
+                if ar_part:
+                    ar_paras.append(ar_part)
+            elif col == 'en':
+                en_part, ar_part = split_ar_en(text)
+                if en_part:
+                    en_paras.append(en_part)
+                # any Arabic that leaked into the English block -> Arabic col
+                if ar_part:
+                    ar_paras.append(ar_part)
+            elif col == 'cop':
+                cop_paras.append(text)
             else:
-                if cur:
-                    line_groups.append(cur)
-                cur = [word]
-                base_y = word['top']
-        if cur:
-            line_groups.append(cur)
+                ar_paras.append(text)
 
-        prev_y = None
-        for group in line_groups:
-            avg_y = sum(ww['top'] for ww in group) / len(group)
-
-            # Insert blank gap row on large vertical jumps (paragraph breaks)
-            if prev_y is not None and (avg_y - prev_y) > 18:
-                rows_out.append('<tr class="gap"><td></td><td></td><td></td></tr>')
-            prev_y = avg_y
-
-            def col_words(lo, hi):
-                ws = sorted(
-                    [(ww['x0'], ww['text']) for ww in group
-                     if lo <= (ww['x0'] + ww['x1']) / 2 < hi],
-                    key=lambda t: t[0]
-                )
-                return ' '.join(t for _, t in ws)
-
-            en  = esc(clean(col_words(0,  c1)))
-            cop = esc(clean(col_words(c1, c2)))
-            ar  = esc(clean(col_words(c2, w * 1.1)))
-
-            rows_out.append(
-                f'<tr>'
-                f'<td class="en">{en}</td>'
-                f'<td class="cop">{cop}</td>'
-                f'<td class="ar">{ar}</td>'
-                f'</tr>'
-            )
-
-        # Thin rule between pages
-        if page_num < total_pages - 1:
-            rows_out.append('<tr class="pb"><td colspan="3"></td></tr>')
+# ---------- write HTML ----------
 
 with open('index.html', 'w', encoding='utf-8') as f:
     f.write(HTML_HEAD)
-    f.write('\n'.join(rows_out))
+    for p in en_paras:
+        f.write(f'<p>{esc(p)}</p>\n')
+    f.write(HTML_MID1)
+    for p in cop_paras:
+        f.write(f'<p>{esc(p)}</p>\n')
+    f.write(HTML_MID2)
+    for p in ar_paras:
+        f.write(f'<p>{esc(p)}</p>\n')
     f.write(HTML_FOOT)
 
-print(f"Done. {total_pages} pages, {len(rows_out)} rows in index.html")
+print(f"Done. en={len(en_paras)} cop={len(cop_paras)} ar={len(ar_paras)} paragraphs")
