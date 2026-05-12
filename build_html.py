@@ -6,6 +6,14 @@ def clean(text):
     # Collapse 4x repeated characters (PDF bold font artifact: "TTTThhhheeee" -> "The")
     return re.sub(r'(.)\1{3,}', r'\1', text)
 
+# Arabic combining/diacritical mark ranges (tashkeel, etc.)
+ARABIC_DIACRITICS = re.compile(
+    r'^[\sؐ-ًؚ-ٰٟۖ-ۜ۟-۪ۤۧۨ-ۭ‌‍﻿]+$'
+)
+
+def is_real_word(word):
+    return not ARABIC_DIACRITICS.match(word['text'])
+
 HTML_HEAD = '''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -45,13 +53,15 @@ with pdfplumber.open("crowning_Crowning Prayer Paul & Tabitha.pdf") as pdf:
     total_pages = len(pdf.pages)
     for page_num, page in enumerate(pdf.pages):
         w = page.width
-        c1 = w * 0.42   # English / Coptic boundary
-        c2 = w * 0.70   # Coptic / Arabic boundary
+        c1 = w * 0.35   # English / Coptic boundary (~35%)
+        c2 = w * 0.66   # Coptic / Arabic boundary (~66%, gap confirmed at 64-68%)
 
         words = page.extract_words(x_tolerance=3, y_tolerance=3)
         if not words:
             continue
 
+        # Drop Arabic-diacritical-only tokens (combining marks extracted as lone words)
+        words = [ww for ww in words if is_real_word(ww)]
         words.sort(key=lambda ww: (round(ww['top']), ww['x0']))
 
         # Group words into lines by y-proximity
